@@ -1542,6 +1542,9 @@ var qrcodegen;
       if (this.channel || this.closed) { channel.close(); return; }
       this.channel = channel; channel.binaryType = 'arraybuffer'; channel.bufferedAmountLowThreshold = 65536;
       channel.onopen = async () => {
+        // 브라우저가 협상 갱신 중 open을 다시 알리더라도 인증 시작은 한 번만 수행합니다.
+        if (this.openHandled) return;
+        this.openHandled = true;
         try {
           await this.verifyLanPath();
           if (this.closed) return;
@@ -1731,6 +1734,9 @@ var qrcodegen;
         pipe.send({ t: 'begin', size: this.packet.bytes.length, iv: this.packet.iv });
         await pipe.sendBytes(this.packet.bytes, value => this.callbacks.progress?.(value));
         pipe.send({ t: 'end' });
+      } else if (data.t === 'auth') {
+        // 이미 검증한 동일 채널의 재전송 인증은 begin을 중복 전송하지 않고 무시합니다.
+        return;
       } else {
         assert(data.t === 'received', '잘못된 수신 확인입니다.');
         this.close('done');
@@ -1779,10 +1785,17 @@ var qrcodegen;
       }
       assert(isPlain(data), '잘못된 전송 메시지입니다.');
       if (data.t === 'challenge') {
-        assert(!this.authenticated && typeof data.challenge === 'string', '중복된 연결 인증입니다.');
-        fromUrl64(data.challenge, 24); this.authenticated = true;
+        assert(typeof data.challenge === 'string', '잘못된 연결 인증입니다.');
+        fromUrl64(data.challenge, 24);
+        if (this.authenticated) {
+          assert(data.challenge === this.challenge && this.authProof, '연결 인증 값이 변경되었습니다.');
+          this.pipe.send({ t: 'auth', proof: this.authProof });
+          return;
+        }
+        this.challenge = data.challenge; this.authenticated = true;
         const proof = await crypto.subtle.sign('HMAC', this.keys.authentication, proofText(this.invite.peer, data.challenge));
-        if (!this.closed) this.pipe.send({ t: 'auth', proof: url64(new Uint8Array(proof)) });
+        this.authProof = url64(new Uint8Array(proof));
+        if (!this.closed) this.pipe.send({ t: 'auth', proof: this.authProof });
       } else if (data.t === 'begin') {
         assert(this.authenticated && !this.buffer && Number.isInteger(data.size) && data.size >= 16 && data.size <= PLAIN_LIMIT + 16, '잘못된 전송 크기입니다.');
         fromUrl64(data.iv, 12); this.iv = data.iv; this.offset = 0; this.buffer = new Uint8Array(data.size);
@@ -1802,6 +1815,7 @@ var qrcodegen;
       if (this.closed) return;
       this.closed = true; clearTimeout(this.timer); clearTimeout(this.finishTimer);
       this.signalLink?.close(); this.pipe?.close(); this.buffer?.fill(0); this.buffer = null; this.keys = null;
+      this.challenge = this.authProof = null;
       if (this.invite) this.invite.secret = '';
       if (!this.delivered && error) this.callbacks.error?.(error);
     }
