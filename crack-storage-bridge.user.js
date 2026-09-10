@@ -25,7 +25,7 @@
     'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array',
     'BigUint64Array',
   ].filter(name => typeof globalThis[name] === 'function').map(name => [name, globalThis[name]]));
-  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  const assert = (condition, message) => { if (!condition) { console.log(message); throw new Error(message); } };
   const isObject = value => value !== null && typeof value === 'object';
   const isPlain = value => Object.prototype.toString.call(value) === '[object Object]';
   const textBytes = value => new TextEncoder().encode(value);
@@ -1517,14 +1517,15 @@ var qrcodegen;
     constructor(signaling, remote, id, onData, onClose) {
       this.signaling = signaling; this.remote = remote; this.id = id; this.onData = onData; this.onClose = onClose;
       this.closed = false; this.chain = Promise.resolve(); this.pending = 0; this.candidates = 0;
-      this.pendingCandidates = []; this.localCandidates = []; this.descriptionSent = false;
+      this.pendingCandidates = []; this.localCandidates = [];
+      this.descriptionSent = false; this.candidatesReady = false;
       this.pc = new RTCPeerConnection(ICE_CONFIG);
       this.pc.onicecandidate = event => {
         if (event.candidate && !this.closed && !signaling.closed && isLanCandidate(event.candidate)) {
           try {
             const candidate = event.candidate.toJSON();
             this.localCandidates.push(candidate);
-            if (this.descriptionSent) this.sendCandidate(candidate);
+            if (this.descriptionSent && this.candidatesReady) this.sendCandidate(candidate);
           }
           catch (error) { this.close(error); }
         }
@@ -1581,6 +1582,9 @@ var qrcodegen;
         assert(message.payload.sdp?.type === 'answer', '잘못된 연결 응답입니다.');
         await this.pc.setRemoteDescription(lanOnlyDescription(message.payload.sdp));
         await this.flushCandidates();
+        // Firefox offerer는 answer 적용 전까지 자신의 mDNS 이름에 응답하지 않을 수 있습니다.
+        this.candidatesReady = true;
+        this.sendLocalCandidates();
       } else if (message.type === 'CANDIDATE') {
         assert(++this.candidates <= 128, '연결 후보가 너무 많습니다.');
         assert(isLanCandidate(message.payload.candidate), 'LAN 밖의 연결 후보를 거부했습니다.');
@@ -1596,16 +1600,19 @@ var qrcodegen;
         this.signaling.send('OFFER', this.remote,
           { type: 'data', connectionId: this.id, sdp: lanOnlyDescription(this.pc.localDescription), label: 'csb2', serialization: 'raw', reliable: true });
         this.descriptionSent = true;
-        for (const candidate of this.localCandidates) this.sendCandidate(candidate);
+        if (this.candidatesReady) this.sendLocalCandidates();
       }
     }
     resignalAnswer() {
       if (!this.closed && this.pc.localDescription?.type === 'answer') {
         this.signaling.send('ANSWER', this.remote,
           { type: 'data', connectionId: this.id, sdp: lanOnlyDescription(this.pc.localDescription) });
-        this.descriptionSent = true;
-        for (const candidate of this.localCandidates) this.sendCandidate(candidate);
+        this.descriptionSent = this.candidatesReady = true;
+        this.sendLocalCandidates();
       }
+    }
+    sendLocalCandidates() {
+      for (const candidate of this.localCandidates) this.sendCandidate(candidate);
     }
     sendCandidate(candidate) {
       this.signaling.send('CANDIDATE', this.remote, { type: 'data', connectionId: this.id, candidate });
