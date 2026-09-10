@@ -1311,16 +1311,51 @@ var qrcodegen;
     })(QrSegment = qrcodegen.QrSegment || (qrcodegen.QrSegment = {}));
 })(qrcodegen || (qrcodegen = {}));
 
-  // ── 연결 설정: 공개 PeerServer는 연결 정보만 소개합니다. 데이터 저장/중계 서버는 두지 않습니다.
+  // ── 연결 설정: 공개 PeerServer는 연결 정보만 소개하고, 실제 데이터 경로는 LAN 후보만 허용합니다.
   // PeerServer v1 프로토콜 참고: peers/peerjs v1.5.5의 socket.ts와 negotiator.ts.
   const SIGNAL_URL = 'wss://0.peerjs.com/peerjs';
-  const ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  const ICE_CONFIG = { iceServers: [], iceTransportPolicy: 'all' };
   const SESSION_MS = 10 * 60 * 1000;
   const CONNECT_MS = 25000;
   const CHUNK_SIZE = 16 * 1024;
   const randomBytes = count => crypto.getRandomValues(new Uint8Array(count));
   const hexId = () => Array.from(randomBytes(16), value => value.toString(16).padStart(2, '0')).join('');
   const url64 = bytes => base64(bytes).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+
+  // ── LAN 후보 검사: STUN/TURN과 공인 주소 후보를 보내지도 받지도 않아 WAN 경로를 만들지 않습니다.
+  function isPrivateAddress(address) {
+    if (typeof address !== 'string') return false;
+    const value = address.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
+    if (value.endsWith('.local')) return /^[a-z0-9-]{1,253}\.local$/.test(value);
+    const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value);
+    if (ipv4) {
+      const parts = ipv4.slice(1).map(Number);
+      if (parts.some(part => part > 255)) return false;
+      return parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+        (parts[0] === 192 && parts[1] === 168) || (parts[0] === 169 && parts[1] === 254);
+    }
+    return /^(?:fc|fd)[0-9a-f]{2}:/i.test(value) || /^fe[89ab][0-9a-f]:/i.test(value);
+  }
+  function candidateAddress(candidate) {
+    if (typeof candidate?.address === 'string') return candidate.address;
+    const parts = typeof candidate?.candidate === 'string' ? candidate.candidate.trim().split(/\s+/) : [];
+    return parts.length >= 8 ? parts[4] : '';
+  }
+  function isLanCandidate(candidateInit) {
+    try {
+      const candidate = candidateInit instanceof RTCIceCandidate ? candidateInit : new RTCIceCandidate(candidateInit);
+      const parts = candidate.candidate.trim().split(/\s+/);
+      const typeAt = parts.indexOf('typ');
+      const type = candidate.type || (typeAt >= 0 ? parts[typeAt + 1] : '');
+      return type === 'host' && isPrivateAddress(candidateAddress(candidate));
+    } catch { return false; }
+  }
+  function lanOnlyDescription(description) {
+    assert(description && typeof description.type === 'string' && typeof description.sdp === 'string', '잘못된 연결 설명입니다.');
+    // 후보는 SDP와 중복시키지 않고 검사된 trickle 메시지로만 보냅니다.
+    const lines = description.sdp.split(/\r?\n/).filter(line => !line.startsWith('a=candidate:') && line !== 'a=end-of-candidates');
+    return { type: description.type, sdp: `${lines.filter(Boolean).join('\r\n')}\r\n` };
+  }
   function fromUrl64(text, size) {
     assert(typeof text === 'string' && /^[A-Za-z0-9_-]+$/.test(text), '전송 링크가 올바르지 않습니다.');
     const value = unbase64(text.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - text.length % 4) % 4), size);
@@ -1384,48 +1419,92 @@ var qrcodegen;
 
   // ── 시그널링 연결: 저장 데이터/인증 키를 보내지 않으며, 종료·오류 시 heartbeat도 정리합니다.
   class Signaling {
-    constructor(id, onMessage, onFailure) {
-      this.id = id; this.onMessage = onMessage; this.onFailure = onFailure;
-      this.closed = false; this.ready = false; this.pending = 0; this.chain = Promise.resolve();
+    constructor(id, onMessage, onFailure, onReconnect = () => {}) {
+      this.id = id; this.onMessage = onMessage; this.onFailure = onFailure; this.onReconnect = onReconnect;
+      this.closed = false; this.ready = false; this.everOpened = false; this.retries = 0;
+      this.pending = 0; this.chain = Promise.resolve(); this.outbox = []; this.token = hexId();
     }
     open() {
       return new Promise((resolve, reject) => {
         this.rejectOpen = reject;
-        const query = new URLSearchParams({ key: 'peerjs', id: this.id, token: hexId(), version: '1.5.5' });
-        this.socket = new WebSocket(`${SIGNAL_URL}?${query}`);
-        this.timer = setTimeout(() => this.fail(new Error('연결 서버에 접속하지 못했습니다. 인터넷 연결이나 네트워크 차단을 확인해 주세요.')), 15000);
-        this.socket.onmessage = event => {
-          if (this.closed) return;
+        this.resolveOpen = resolve;
+        this.connect();
+      });
+    }
+    connect() {
+      if (this.closed) return;
+      this.ready = false;
+      const query = new URLSearchParams({ key: 'peerjs', id: this.id, token: this.token, version: '1.5.5' });
+      const socket = new WebSocket(`${SIGNAL_URL}?${query}`);
+      this.socket = socket;
+      this.timer = setTimeout(() => {
+        if (this.socket === socket) {
+          socket.onclose = null;
+          try { socket.close(); } catch { /* 이미 닫힌 소켓입니다. */ }
+          this.retryOrFail(new Error('연결 서버 응답 시간이 초과되었습니다. Firefox의 추적 방지·DNS/VPN 설정을 확인해 주세요.'));
+        }
+      }, 15000);
+      socket.onmessage = event => {
+          if (this.closed || this.socket !== socket) return;
           if (typeof event.data !== 'string' || event.data.length > 160000 || this.pending >= 200) { this.fail(new Error('연결 서버의 응답이 올바르지 않습니다.')); return; }
           let message;
           try { message = JSON.parse(event.data); } catch { this.fail(new Error('연결 서버 응답을 읽지 못했습니다.')); return; }
           if (message.type === 'OPEN' && !this.ready) {
-            this.ready = true; clearTimeout(this.timer); this.rejectOpen = null;
+            const reconnected = this.everOpened;
+            this.ready = true; this.everOpened = true; this.retries = 0; clearTimeout(this.timer);
+            const resolve = this.resolveOpen; this.resolveOpen = null; this.rejectOpen = null;
+            clearInterval(this.heartbeat);
             this.heartbeat = setInterval(() => { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send('{"type":"HEARTBEAT"}'); }, 5000);
-            resolve(); return;
+            while (this.outbox.length && socket.readyState === WebSocket.OPEN) socket.send(this.outbox.shift());
+            resolve?.();
+            if (reconnected) Promise.resolve(this.onReconnect()).catch(error => this.fail(error));
+            return;
+          }
+          if (message.type === 'ID-TAKEN' && this.everOpened) {
+            socket.onclose = null; try { socket.close(); } catch { /* 이미 닫힌 소켓입니다. */ }
+            this.retryOrFail(new Error('연결 ID가 아직 서버에서 정리되지 않았습니다.')); return;
           }
           if (['ERROR', 'ID-TAKEN', 'INVALID-KEY'].includes(message.type)) { this.fail(new Error('연결 서버를 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.')); return; }
           this.pending++;
           this.chain = this.chain.then(async () => { if (!this.closed) await this.onMessage(message); })
             .catch(error => this.fail(error)).finally(() => { this.pending--; });
         };
-        this.socket.onerror = () => this.fail(new Error('연결 서버 접속이 차단되었거나 연결이 끊어졌습니다.'));
-        this.socket.onclose = () => { if (!this.closed) this.fail(new Error('연결 서버와의 접속이 끝났습니다. 새 링크로 다시 시도해 주세요.')); };
-      });
+      socket.onerror = () => { /* Firefox는 상세 원인을 숨기므로 close의 코드와 재접속 결과로 판단합니다. */ };
+      socket.onclose = event => {
+        if (this.closed || this.socket !== socket) return;
+        clearTimeout(this.timer); clearInterval(this.heartbeat); this.ready = false;
+        this.retryOrFail(new Error(`연결 서버 접속이 종료되었습니다 (코드 ${event.code || '없음'}${event.reason ? `: ${event.reason}` : ''}).`));
+      };
+    }
+    retryOrFail(error) {
+      if (this.closed) return;
+      if (this.retries < 3) {
+        const delay = [500, 1200, 2500][this.retries++];
+        clearTimeout(this.retryTimer);
+        this.retryTimer = setTimeout(() => this.connect(), delay);
+        return;
+      }
+      this.fail(new Error(`${error.message} 3회 재접속에도 실패했습니다. Firefox에서 https://0.peerjs.com 접속과 보호 설정을 확인해 주세요.`));
     }
     send(type, dst, payload) {
-      assert(!this.closed && this.ready && this.socket.readyState === WebSocket.OPEN, '연결 서버가 닫혔습니다.');
-      this.socket.send(JSON.stringify({ type, dst, payload }));
+      assert(!this.closed, '연결 서버가 닫혔습니다.');
+      const message = JSON.stringify({ type, dst, payload });
+      if (this.ready && this.socket?.readyState === WebSocket.OPEN) this.socket.send(message);
+      else {
+        assert(this.everOpened && this.outbox.length < 256, '연결 서버가 아직 준비되지 않았습니다.');
+        this.outbox.push(message);
+      }
     }
     fail(error) {
       if (this.closed) return;
-      const reject = this.rejectOpen; this.rejectOpen = null;
+      const reject = this.rejectOpen; this.rejectOpen = this.resolveOpen = null;
       this.close(); reject?.(error); this.onFailure(error);
     }
     close() {
       if (this.closed) return;
-      this.closed = true; clearTimeout(this.timer); clearInterval(this.heartbeat);
-      const reject = this.rejectOpen; this.rejectOpen = null; reject?.(new Error('연결을 취소했습니다.'));
+      this.closed = true; this.ready = false; clearTimeout(this.timer); clearTimeout(this.retryTimer); clearInterval(this.heartbeat);
+      const reject = this.rejectOpen; this.rejectOpen = this.resolveOpen = null; reject?.(new Error('연결을 취소했습니다.'));
+      this.outbox.length = 0;
       if (this.socket) {
         this.socket.onmessage = this.socket.onclose = this.socket.onerror = null;
         this.socket.close(); this.socket = null;
@@ -1438,10 +1517,15 @@ var qrcodegen;
     constructor(signaling, remote, id, onData, onClose) {
       this.signaling = signaling; this.remote = remote; this.id = id; this.onData = onData; this.onClose = onClose;
       this.closed = false; this.chain = Promise.resolve(); this.pending = 0; this.candidates = 0;
+      this.pendingCandidates = []; this.localCandidates = []; this.descriptionSent = false;
       this.pc = new RTCPeerConnection(ICE_CONFIG);
       this.pc.onicecandidate = event => {
-        if (event.candidate && !this.closed && !signaling.closed) {
-          try { signaling.send('CANDIDATE', remote, { type: 'data', connectionId: id, candidate: event.candidate.toJSON() }); }
+        if (event.candidate && !this.closed && !signaling.closed && isLanCandidate(event.candidate)) {
+          try {
+            const candidate = event.candidate.toJSON();
+            this.localCandidates.push(candidate);
+            if (this.descriptionSent) this.sendCandidate(candidate);
+          }
           catch (error) { this.close(error); }
         }
       };
@@ -1456,7 +1540,13 @@ var qrcodegen;
     attach(channel) {
       if (this.channel || this.closed) { channel.close(); return; }
       this.channel = channel; channel.binaryType = 'arraybuffer'; channel.bufferedAmountLowThreshold = 65536;
-      channel.onopen = () => { this.touch(); this.onOpen?.(); };
+      channel.onopen = async () => {
+        try {
+          await this.verifyLanPath();
+          if (this.closed) return;
+          this.touch(); this.onOpen?.();
+        } catch (error) { this.close(error); }
+      };
       channel.onmessage = event => {
         if (this.closed || this.pending >= 256) { this.close(new Error('전송 메시지가 너무 빠르거나 잘못되었습니다.')); return; }
         const raw = event.data;
@@ -1475,24 +1565,74 @@ var qrcodegen;
       this.attach(this.pc.createDataChannel('csb2', { ordered: true }));
       await this.pc.setLocalDescription(await this.pc.createOffer());
       assert(!this.closed, '연결이 취소되었습니다.');
-      this.signaling.send('OFFER', this.remote, { type: 'data', connectionId: this.id, sdp: this.pc.localDescription.toJSON(), label: 'csb2', serialization: 'raw', reliable: true });
+      this.resignalOffer();
     }
     async answer(sdp) {
       assert(sdp?.type === 'offer' && typeof sdp.sdp === 'string', '잘못된 연결 요청입니다.');
-      await this.pc.setRemoteDescription(sdp);
+      await this.pc.setRemoteDescription(lanOnlyDescription(sdp));
+      await this.flushCandidates();
       await this.pc.setLocalDescription(await this.pc.createAnswer());
       assert(!this.closed, '연결이 취소되었습니다.');
-      this.signaling.send('ANSWER', this.remote, { type: 'data', connectionId: this.id, sdp: this.pc.localDescription.toJSON() });
+      this.resignalAnswer();
     }
     async signal(message) {
       if (this.closed) return;
       if (message.type === 'ANSWER') {
         assert(message.payload.sdp?.type === 'answer', '잘못된 연결 응답입니다.');
-        await this.pc.setRemoteDescription(message.payload.sdp);
+        await this.pc.setRemoteDescription(lanOnlyDescription(message.payload.sdp));
+        await this.flushCandidates();
       } else if (message.type === 'CANDIDATE') {
         assert(++this.candidates <= 128, '연결 후보가 너무 많습니다.');
-        await this.pc.addIceCandidate(message.payload.candidate);
+        assert(isLanCandidate(message.payload.candidate), 'LAN 밖의 연결 후보를 거부했습니다.');
+        if (this.pc.remoteDescription) await this.pc.addIceCandidate(message.payload.candidate);
+        else this.pendingCandidates.push(message.payload.candidate);
       }
+    }
+    async flushCandidates() {
+      while (this.pendingCandidates.length) await this.pc.addIceCandidate(this.pendingCandidates.shift());
+    }
+    resignalOffer() {
+      if (!this.closed && this.pc.localDescription?.type === 'offer') {
+        this.signaling.send('OFFER', this.remote,
+          { type: 'data', connectionId: this.id, sdp: lanOnlyDescription(this.pc.localDescription), label: 'csb2', serialization: 'raw', reliable: true });
+        this.descriptionSent = true;
+        for (const candidate of this.localCandidates) this.sendCandidate(candidate);
+      }
+    }
+    resignalAnswer() {
+      if (!this.closed && this.pc.localDescription?.type === 'answer') {
+        this.signaling.send('ANSWER', this.remote,
+          { type: 'data', connectionId: this.id, sdp: lanOnlyDescription(this.pc.localDescription) });
+        this.descriptionSent = true;
+        for (const candidate of this.localCandidates) this.sendCandidate(candidate);
+      }
+    }
+    sendCandidate(candidate) {
+      this.signaling.send('CANDIDATE', this.remote, { type: 'data', connectionId: this.id, candidate });
+    }
+    async verifyLanPath() {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const stats = await this.pc.getStats();
+        let pair;
+        for (const report of stats.values()) {
+          if (report.type === 'transport' && report.selectedCandidatePairId) pair = stats.get(report.selectedCandidatePairId);
+          if (!pair && report.type === 'candidate-pair' && report.state === 'succeeded' && (report.selected || report.nominated)) pair = report;
+        }
+        if (pair) {
+          const local = stats.get(pair.localCandidateId), remote = stats.get(pair.remoteCandidateId);
+          const localAddress = local?.address || local?.ip;
+          const remoteAddress = remote?.address || remote?.ip;
+          // 후보 통계가 제공되면 실제 선택 경로도 재검사합니다. 일부 Safari는 주소 필드를 생략합니다.
+          if (local?.candidateType && remote?.candidateType && localAddress && remoteAddress) {
+            assert(local.candidateType === 'host' && remote.candidateType === 'host' &&
+              isPrivateAddress(localAddress) && isPrivateAddress(remoteAddress), 'LAN 밖의 연결 경로를 차단했습니다. 두 기기를 같은 공유기에 연결해 주세요.');
+          }
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      // 채널에 들어갈 수 있는 양쪽 후보는 이미 사설 host로 제한되었습니다.
+      assert(this.localCandidates.length && this.candidates, 'LAN 연결 후보를 확인하지 못했습니다. 공유기의 기기 격리 설정을 확인해 주세요.');
     }
     send(message) {
       assert(!this.closed && this.channel?.readyState === 'open', '전송 연결이 닫혔습니다.');
@@ -1541,7 +1681,8 @@ var qrcodegen;
         const packet = await encryptDocument(doc, keys.encryption, this.invite.peer);
         if (this.closed) { packet.bytes.fill(0); return null; }
         this.packet = packet;
-        this.signalLink = new Signaling(this.invite.peer, message => this.message(message), error => this.close('error', error));
+        this.signalLink = new Signaling(this.invite.peer, message => this.message(message), error => this.close('error', error),
+          () => { for (const pipe of this.peers.values()) pipe.resignalAnswer(); });
         await this.signalLink.open();
         if (this.closed) return null;
         this.invite.expires = Date.now() + SESSION_MS;
@@ -1556,7 +1697,8 @@ var qrcodegen;
       if (typeof src !== 'string' || !payload || typeof payload.connectionId !== 'string') return;
       const key = `${src}:${payload.connectionId}`;
       if (message.type === 'OFFER') {
-        if (this.peers.size >= 4 || this.peers.has(key) || payload.type !== 'data' || payload.label !== 'csb2') return;
+        if (this.peers.has(key)) { this.peers.get(key).resignalAnswer(); return; }
+        if (this.peers.size >= 4 || payload.type !== 'data' || payload.label !== 'csb2') return;
         const pipe = new PeerPipe(this.signalLink, src, payload.connectionId, data => this.receive(pipe, data), error => {
           this.peers.delete(key);
           if (!this.closed && this.claimed === pipe) this.close('error', error || new Error('전송 연결이 종료되었습니다.'));
@@ -1607,7 +1749,8 @@ var qrcodegen;
         const keys = await sessionKeys(this.invite);
         if (this.closed) return;
         this.keys = keys;
-        this.signalLink = new Signaling(`csb-${hexId()}`, message => this.message(message), error => this.close(error));
+        this.signalLink = new Signaling(`csb-${hexId()}`, message => this.message(message), error => this.close(error),
+          () => this.pipe?.resignalOffer());
         await this.signalLink.open();
         if (this.closed) return;
         this.pipe = new PeerPipe(this.signalLink, this.invite.peer, `dc-${hexId()}`, data => this.receive(data), error => { if (!this.closed) this.close(error); });
