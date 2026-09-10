@@ -1315,6 +1315,8 @@ var qrcodegen;
   // PeerServer v1 프로토콜 참고: peers/peerjs v1.5.5의 socket.ts와 negotiator.ts.
   const SIGNAL_URL = 'wss://0.peerjs.com/peerjs';
   const ICE_CONFIG = { iceServers: [], iceTransportPolicy: 'all' };
+  const FIREFOX_MDNS_BARRIER = /\bFirefox\/\d+/i.test(navigator.userAgent);
+  const FIREFOX_MDNS_READY_MS = 300;
   const SESSION_MS = 10 * 60 * 1000;
   const CONNECT_MS = 25000;
   const CHUNK_SIZE = 16 * 1024;
@@ -1566,6 +1568,8 @@ var qrcodegen;
       channel.onclose = () => this.close(new Error('보내는 기기가 전송을 종료했거나 연결이 끊어졌습니다.'));
     }
     async offer() {
+      // Chromium은 생성 직후 mDNS 후보를 알려야 하고, Firefox는 answer 적용 뒤에야 mDNS 응답이 안정됩니다.
+      this.candidatesReady = !FIREFOX_MDNS_BARRIER;
       this.attach(this.pc.createDataChannel('csb2', { ordered: true }));
       await this.pc.setLocalDescription(await this.pc.createOffer());
       assert(!this.closed, '연결이 취소되었습니다.');
@@ -1585,9 +1589,13 @@ var qrcodegen;
         assert(message.payload.sdp?.type === 'answer', '잘못된 연결 응답입니다.');
         await this.pc.setRemoteDescription(lanOnlyDescription(message.payload.sdp));
         await this.flushCandidates();
-        // Firefox offerer는 answer 적용 전까지 자신의 mDNS 이름에 응답하지 않을 수 있습니다.
-        this.candidatesReady = true;
-        this.sendLocalCandidates();
+        if (!this.candidatesReady) {
+          // Android Firefox가 setRemoteDescription 직후 mDNS 응답기를 준비할 시간을 줍니다.
+          await new Promise(resolve => setTimeout(resolve, FIREFOX_MDNS_READY_MS));
+          assert(!this.closed, '연결이 취소되었습니다.');
+          this.candidatesReady = true;
+          this.sendLocalCandidates();
+        }
       } else if (message.type === 'CANDIDATE') {
         assert(++this.candidates <= 128, '연결 후보가 너무 많습니다.');
         assert(isLanCandidate(message.payload.candidate), 'LAN 밖의 연결 후보를 거부했습니다.');
