@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack 저장소 공유
 // @namespace    local.crack.storage.bridge
-// @version      1.0.0
+// @version      1.1.0
 // @description  메인페이지에서 임시 링크·QR로 브라우저 저장 데이터를 한 번 전송합니다.
 // @match        https://crack.wrtn.ai/
 // @grant        GM_registerMenuCommand
@@ -53,7 +53,7 @@
   }
 
   // ── 구조화 복제 직렬화: JSON에서 손실되는 타입과 순환·공유 참조를 명시적 노드로 보존합니다.
-  async function encodeGraph(root) {
+  async function encodeGraph(root, fullDetails = false) {
     const seen = new Map();
     const nodes = [];
     const queue = [];
@@ -65,7 +65,7 @@
       if (typeof value === 'bigint') return ['b', String(value)];
       assert(typeof value === 'object', '지원하지 않는 값 타입입니다.');
       if (seen.has(value)) return ['r', seen.get(value)];
-      assert(nodes.length < NODE_LIMIT, '데이터 구조가 너무 큽니다. DB를 나눠 전송해 주세요.');
+      assert(fullDetails || nodes.length < NODE_LIMIT, '데이터 구조가 너무 큽니다. DB를 나눠 전송해 주세요.');
       const id = nodes.length;
       seen.set(value, id);
       nodes.push(null);
@@ -78,7 +78,7 @@
       const tag = Object.prototype.toString.call(value);
       if (Array.isArray(value)) {
         allocatedSlots += value.length;
-        assert(allocatedSlots <= RECORD_LIMIT * 10, '전체 배열 크기 제한을 초과했습니다.');
+        assert(fullDetails || allocatedSlots <= RECORD_LIMIT * 10, '전체 배열 크기 제한을 초과했습니다.');
         nodes[id] = ['array', value.length, Object.keys(value).map(key => [key, token(value[key])])];
       }
       else if (tag === '[object Object]') nodes[id] = ['object', Object.keys(value).map(key => [key, token(value[key])])];
@@ -92,7 +92,7 @@
       else if (tag === '[object ArrayBuffer]') nodes[id] = ['buffer', base64(new Uint8Array(value))];
       else if (ArrayBuffer.isView(value)) nodes[id] = ['view', tag.slice(8, -1), token(value.buffer), value.byteOffset, value.byteLength];
       else if (tag === '[object Blob]' || tag === '[object File]') {
-        assert(value.size <= PLAIN_LIMIT, '전송 데이터/Blob이 너무 큽니다.');
+        assert(fullDetails || value.size <= PLAIN_LIMIT, '전송 데이터/Blob이 너무 큽니다.');
         nodes[id] = ['blob', base64(new Uint8Array(await value.arrayBuffer())), value.type,
           tag === '[object File]' ? value.name : null, tag === '[object File]' ? value.lastModified : null];
       } else throw new Error(`지원하지 않는 저장 값 ${tag}: 원본은 변경하지 않습니다.`);
@@ -287,7 +287,7 @@
   }
 
   // ── DB 스냅샷: 모든 스토어를 하나의 읽기 트랜잭션에서 읽습니다. 비동기 암호화는 종료 후 수행합니다.
-  async function readDatabase(name, metadataOnly = false, previewLimit = null) {
+  async function readDatabase(name, metadataOnly = false, previewLimit = null, fullDetails = false) {
     const db = await openExisting(name);
     if (!db) return null;
     try {
@@ -307,7 +307,7 @@
           request.onsuccess = () => {
             const cursor = request.result;
             if (!cursor) return;
-            if (++count > RECORD_LIMIT) { failure = new Error(`DB ${name}: 레코드 제한 초과`); transaction.abort(); return; }
+            if (++count > RECORD_LIMIT && !fullDetails) { failure = new Error(`DB ${name}: 레코드 제한 초과`); transaction.abort(); return; }
             store.records.push({ key: cursor.primaryKey, value: cursor.value });
             if (previewLimit === null || store.records.length < previewLimit) cursor.continue();
           };
@@ -1877,35 +1877,28 @@ var qrcodegen;
     return { items, issues };
   }
 
-  // ── 상세보기: 작성자는 단정하지 않고 구조와 제한된 실제 값만 보여 줍니다.
-  function previewText(value) {
-    let budget = 300;
+  // ── 전체 상세 JSON: 특수 타입·순환 참조는 내용을 보존하는 전체 노드 형식으로 표시합니다.
+  async function previewText(value) {
     const seen = new WeakSet();
-    function visit(current, depth) {
-      if (--budget < 0) return '[이하 생략]';
-      if (typeof current === 'string') return current.length > 1200 ? `${current.slice(0, 1200)}… [생략]` : current;
-      if (typeof current === 'bigint') return `${current}n`;
-      if (current === undefined) return '[undefined]';
-      if (typeof current === 'number' && !Number.isFinite(current)) return String(current);
-      if (!isObject(current)) return current;
-      if (seen.has(current)) return '[순환/공유 참조]';
-      seen.add(current);
-      const type = Object.prototype.toString.call(current).slice(8, -1);
-      if (type === 'Date') return Number.isNaN(current.getTime()) ? '[Invalid Date]' : current.toISOString();
-      if (type === 'Blob' || type === 'File') return `[${type}: ${sizeText(current.size)}, ${current.type || '유형 없음'}]`;
-      if (type === 'ArrayBuffer' || ArrayBuffer.isView(current)) return `[${type}: ${sizeText(current.byteLength)}]`;
-      if (depth >= 5) return `[${type}: 깊이 제한]`;
-      if (current instanceof Map) return { Map: Array.from(current).slice(0, 20).map(([key, item]) => [visit(key, depth + 1), visit(item, depth + 1)]) };
-      if (current instanceof Set) return { Set: Array.from(current).slice(0, 20).map(item => visit(item, depth + 1)) };
-      if (type === 'RegExp') return String(current);
-      if (Array.isArray(current)) return current.slice(0, 20).map(item => visit(item, depth + 1));
-      const result = Object.create(null);
-      const keys = Object.keys(current);
-      for (const key of keys.slice(0, 20)) result[key] = visit(current[key], depth + 1);
-      if (keys.length > 20) result['…'] = `${keys.length - 20}개 속성 생략`;
-      return result;
-    }
-    return JSON.stringify(visit(value, 0), null, 2).slice(0, 20000);
+    try {
+      const json = JSON.stringify(value, function(key, current) {
+        const original = this[key];
+        if (original === undefined || typeof original === 'bigint' ||
+            (typeof original === 'number' && (!Number.isFinite(original) || Object.is(original, -0)))) {
+          throw new Error('구조화 데이터 형식이 필요합니다.');
+        }
+        if (isObject(original)) {
+          const tag = Object.prototype.toString.call(original);
+          if (!['[object Object]', '[object Array]'].includes(tag) || seen.has(original)) {
+            throw new Error('구조화 데이터 형식이 필요합니다.');
+          }
+          seen.add(original);
+        }
+        return current;
+      }, 2);
+      if (json !== undefined) return json;
+    } catch { /* 특수 타입과 공유·순환 참조도 아래 형식으로 보존합니다. */ }
+    return JSON.stringify(await encodeGraph(value, true), null, 2);
   }
   function qrImage(text) {
     const qr = qrcodegen.QrCode.encodeText(text, qrcodegen.QrCode.Ecc.MEDIUM);
@@ -1932,6 +1925,10 @@ var qrcodegen;
     h2 { font-size: 20px; font-weight: 750; letter-spacing: -.5px; margin: 0; flex: 1; } h3 { font-size: 17px; margin: 8px 0; } p { margin: 8px 0; }
     .icon { width: 40px; height: 40px; border-radius: 12px; flex-shrink: 0; background: transparent; font-size: 22px; color: #62718b; }
     .icon:hover { background: #f0f4fa; } .back { margin-left: -10px; }
+    .detail-json { border: 1px solid #e4eaf2; border-radius: 10px; background: #f6f8fc; overflow: hidden; }
+    .detail-toolbar { display: flex; justify-content: flex-end; padding: 8px; }
+    .detail-toolbar button { padding: 6px 12px; }
+    .detail-json pre { margin: 0; border: 0; border-radius: 0; }
     .content { overflow-y: auto; padding: 4px 24px 18px; min-height: 0; overscroll-behavior: contain; }
     .subtitle,.muted { color: #68778d; } .subtitle { margin: 0 0 20px; } .tiny { font-size: 12px; }
     .footer { padding: 14px 24px 22px; border-top: 1px solid #edf0f5; background: #fff; flex-shrink: 0; }
@@ -2108,21 +2105,30 @@ var qrcodegen;
           if (item.kind === 'local') {
             const value = received ? item.value : localStorage.getItem(item.name);
             let parsed = value;
-            if (typeof value === 'string' && value.length < 200000) { try { parsed = JSON.parse(value); } catch { /* 일반 문자열은 그대로 표시합니다. */ } }
-            preview = `Local Storage · ${sizeText(textBytes(value ?? '').length)}\n\n${previewText(parsed)}`;
+            if (typeof value === 'string') { try { parsed = JSON.parse(value); } catch { /* 일반 문자열은 그대로 표시합니다. */ } }
+            preview = await previewText(parsed);
           } else {
             say('DB 내용을 읽고 있어요…');
-            const db = received ? item.db : await readDatabase(item.name, false, 5);
+            const db = received ? item.db : await readDatabase(item.name, false, null, true);
             if (!alive(version)) return;
             assert(db, '이 데이터가 더 이상 존재하지 않습니다.');
-            preview = previewText({ name: db.name, version: db.version, stores: db.stores.map(store => ({
+            preview = await previewText({ name: db.name, version: db.version, stores: db.stores.map(store => ({
               name: store.name, keyPath: store.keyPath, autoIncrement: store.autoIncrement,
-              indexes: store.indexes, sampleRecords: store.records.slice(0, 5),
+              indexes: store.indexes, records: store.records,
             })) });
           }
           if (!alive(version)) return;
+          // 화면과 복사 버튼은 같은 전체 JSON을 사용하며 HTML로 해석하지 않습니다.
+          const details = element('div', '', { class: 'detail-json' });
+          const toolbar = element('div', '', { class: 'detail-toolbar' });
+          toolbar.append(button('JSON 복사', () => perform(async () => {
+            if (typeof GM_setClipboard === 'function') await GM_setClipboard(preview, 'text');
+            else await navigator.clipboard.writeText(preview);
+            say('전체 JSON을 복사했어요.');
+          })));
+          details.append(toolbar, element('pre', preview));
           status.textContent = ''; content.append(element('p', guessedOwner(item.name), { class: 'muted tiny' }),
-            element('pre', preview), element('p', '저장소에는 작성자 정보가 없습니다. 이름 추정은 확정 정보가 아니며, 긴 값은 일부만 표시합니다. DB는 보관함마다 최대 5건의 샘플입니다.', { class: 'muted tiny' }));
+            details, element('p', '저장소에는 작성자 정보가 없습니다. 이름 추정은 확정 정보가 아닙니다. 특수 데이터와 순환 참조는 전체 노드 JSON 형식으로 표시합니다.', { class: 'muted tiny' }));
           cta('목록으로', returnToList);
         }
 
